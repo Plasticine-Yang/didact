@@ -1,0 +1,19 @@
+{
+  "name": "didact",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "vite"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^18.11.15",
+    "@vitejs/plugin-react": "^3.0.0",
+    "typescript": "^4.9.4",
+    "vite": "^4.0.1"
+  }
+}
