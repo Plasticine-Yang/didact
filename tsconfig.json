@@ -3,6 +3,7 @@
     "module": "ESNext",
     "target": "ESNext",
     "moduleResolution": "Node",
-    "jsx": "preserve"
+    "jsx": "preserve",
+    "esModuleInterop": true
   }
 }
