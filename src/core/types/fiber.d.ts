@@ -1,4 +1,8 @@
-interface Fiber<T extends string = string> {
+interface Fiber<
+  T extends string | JSXElementConstructor<any> =
+    | string
+    | JSXElementConstructor<any>,
+> {
   child: Fiber | null
   sibling: Fiber | null
   parent: Fiber | null

@@ -1,6 +1,11 @@
-// type JSXElementConstructor<P> = (props: P) => DidactElement<any, any> | null
+type JSXElementConstructor<P> = (props: P) => DidactElement<any, any> | null
 
-interface DidactElement<P = any, T extends string = string> {
+interface DidactElement<
+  P = any,
+  T extends string | JSXElementConstructor<any> =
+    | string
+    | JSXElementConstructor<any>,
+> {
   type: T
   props: P
 }

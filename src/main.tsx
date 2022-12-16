@@ -1,10 +1,14 @@
 import Didact from './core'
-import { renderBenchmark } from './examples/render-benchmark'
 
-renderBenchmark({
-  nodeCount: 10000,
-  minNestedLevel: 30,
-  maxNestedLevel: 100,
-  hostCreateElement: Didact.createElement,
-  hostRender: Didact.render,
-})
+interface Props {
+  name: string
+}
+
+/** @jsx Didact.createElement */
+function App(props: Props) {
+  const { name } = props
+
+  return <div>name: {name}</div>
+}
+
+Didact.render(<App name="foo" />, document.getElementById('root'))

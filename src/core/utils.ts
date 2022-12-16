@@ -16,4 +16,14 @@ const isEventPropertyKey = (key: string) => key.startsWith('on')
 /** @description 获取事件属性名 */
 const eventType = (name: string) => name.toLowerCase().substring(2)
 
-export { isProperty, isGone, isNew, isEventPropertyKey, eventType }
+/** @description 判断 fiber 是否是函数组件 */
+const isFunctionComponent = (fiber: Fiber) => typeof fiber.type === 'function'
+
+export {
+  isProperty,
+  isGone,
+  isNew,
+  isEventPropertyKey,
+  eventType,
+  isFunctionComponent,
+}

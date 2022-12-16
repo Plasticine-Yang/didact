@@ -16,6 +16,10 @@
 
 我自己实现的版本会使用 TypeScript，并且使用 vite 方便查看效果
 
+为了不浪费篇章，不会把完整代码贴出来，有需要的请自行 clone 仓库，阅读到相关内容时 checkout 到对应分支查看相关代码
+
+[仓库地址：https://github.com/Plasticine-Yang/didact/branches](https://github.com/Plasticine-Yang/didact/branches)
+
 ## 1. Didact 命名的含义
 
 > We need a name that sounds like React but also hints its didactic purpose.
@@ -274,7 +278,7 @@ function render(element: DidactElement, container: HTMLElement): void {
 
 至此，我们的 MVP 版本就算完成了
 
-完整代码可自行 checkout mvp 分支查看
+完整代码可自行 checkout `mvp` 分支查看~
 
 ## 3. Concurrent Mode
 
@@ -554,6 +558,8 @@ function performUnitOfWork(unitOfWork: any) {
 
 现在的问题是，工作单元到底是个啥玩意儿？我们要怎么执行它？由于目前不知道它是什么，因此只能先将其类型标记为 any，实际上工作单元就是 React 中重要的 fiber 对象！
 
+完整代码可自行 checkout `concurrent-mode` 分支查看~
+
 ## 4. Fiber 架构
 
 为了更好地了解 Fiber 架构，接下来我们以渲染如下 DidactElement 为例
@@ -818,6 +824,8 @@ function performUnitOfWork(fiber: Fiber): Fiber | null {
 
 也是符合我们在 `main.tsx` 中编写的 tsx 结构的
 
+完整代码可自行 checkout `fiber` 分支查看~
+
 ## 5. render 和 commit 分离
 
 ### 5.1. 目前存在的问题
@@ -963,6 +971,8 @@ function commitWork(fiber: Fiber) {
 ![render和commit分离后的效果.gif](https://p1-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/ab312002895d4891a46088878a1696d9~tplv-k3u1fbpfcp-watermark.image?)
 
 可以看到，开始的时候白屏是因为在构建 fiber tree，等 fiber tree 构建好后，会一次性被 commitRoot 将其渲染到视图上，符合我们的预期
+
+完整代码可自行 checkout `render-and-commit-phase` 分支查看~
 
 ## 6. Reconciliation
 
@@ -1555,3 +1565,260 @@ function commitRoot() {
 ```
 
 至此，我们的 reconciliation 就算完成啦
+
+完整代码可自行 checkout `reconciliation` 分支查看~
+
+## 7. Function Component
+
+前面我们实现了对 element 的更新和删除逻辑，但是我们目前还没办法验证效果，因为我们的 jsx 转换成 element 后没有办法发生变化或者删除，为此我们还需要实现函数式组件以及 useState 去触发更新和删除的操作
+
+首先我们修改一下我们的 `main.tsx`，把最重要渲染的目标先写出来
+
+```tsx
+interface Props {
+  name: string
+}
+
+/** @jsx Didact.createElement */
+function App(props: Props) {
+  const { name } = props
+
+  return <div>name: {name}</div>
+}
+
+Didact.render(<App name="foo" />, document.getElementById('root'))
+```
+
+### 7.1. 目前 performUnitOfWork 存在的问题
+
+我们现在要增加对函数组件的支持，应当先修改 fiber 处理的入口，也就是 performUnitOfWork
+
+原本的 performUnitOfWork 是这样的：
+
+```ts
+function performUnitOfWork(fiber: Fiber): Fiber | null {
+  // - 遍历子元素 FiberChild 对象，依次为它们创建 fiber 对象，并将 fiber 对象加入到当前工作单元 fiber 中，逐步构造 fiber tree
+  if (!fiber.dom) {
+    // 不存在 dom 的则先创建 DOM
+    fiber.dom = createDOM(fiber)
+  }
+
+  reconcileChildren(fiber, fiber.props.children)
+
+  // ...
+}
+```
+
+对函数组件来说，这样的处理方式有两个问题：
+
+1. 这里的处理只对单纯的 jsx 元素有效，因为 jsx 元素的 props 会被挂载到 fiber.props.children 上，但是对于函数组件，其 children 的获取需要先执行函数才能得到
+
+2. createDOM 的实现中并没有对函数组件的支持，这意味着不能为函数组件的 fiber 创建 DOM
+
+   ```ts
+   function createDOM(fiber: Fiber) {
+     const { type, props } = fiber
+
+     // 将 element 转成真实 DOM -- 需要注意对于文本节点类型的处理
+     const dom =
+       type === 'TEXT_ELEMENT'
+         ? document.createTextNode('')
+         : // 函数组件不支持
+           document.createElement(type as string)
+
+     // 把 element.props 赋值到 DOM 元素上
+     Object.keys(props)
+       .filter(isProperty)
+       .forEach((name) => {
+         dom[name] = props[name]
+       })
+
+     return dom
+   }
+   ```
+
+### 7.2. 修改 performUnitOfWork 支持处理函数组件
+
+通过上面的问题分析，我们需要先将原先这部分对 jsx 元素的处理逻辑提取成函数，而对函数组件的处理逻辑则放到另外的函数中实现
+
+```ts
+function performUnitOfWork(fiber: Fiber): Fiber | null {
+  // - 遍历子元素 FiberChild 对象，依次为它们创建 fiber 对象，并将 fiber 对象加入到当前工作单元 fiber 中，逐步构造 fiber tree
+  if (isFunctionComponent(fiber)) {
+    updateFunctionComponent(fiber)
+  } else {
+    updateHostComponent(fiber)
+  }
+
+  // ...
+}
+
+/**
+ * @description 更新 HostComponent -- 也就是 div、p 等原生标签类型
+ */
+function updateHostComponent(fiber: Fiber) {
+  if (!fiber.dom) {
+    // 不存在 dom 的则先创建 DOM
+    fiber.dom = createDOM(fiber)
+  }
+
+  reconcileChildren(fiber, fiber.props.children)
+}
+
+/**
+ * @description 更新函数组件
+ */
+function updateFunctionComponent(fiber: Fiber) {
+  // TODO
+}
+```
+
+### 7.3. 修改 Fiber 类型的 type 属性
+
+由于目前我们要兼顾处理函数组件，因此 type 不仅仅是 string 了，还可能是函数，所以对 type 属性的类型声明修改如下：
+
+```ts
+type JSXElementConstructor<P> = (props: P) => DidactElement<any, any> | null
+
+interface Fiber<
+  T extends string | JSXElementConstructor<any> =
+    | string
+    | JSXElementConstructor<any>,
+> {
+  // ...
+  type: T
+  // ...
+}
+```
+
+主要是修改了一下泛型，扩展了一个函数类型的联合类型使得 type 支持接收函数类型
+
+### 7.4. 实现 updateFunctionComponent
+
+现在入口已经分离了，我们只用专心实现 updateFunctionComponent 即可
+
+首先解决上面说到的第一个问题 -- 函数组件 children 的获取
+
+只要能够顺利获取到 children，那么我们就可以直接将其丢给 reconcileChildren 函数去处理即可，内部逻辑不需要改变
+
+对于普通的 jsx 元素，能够通过 `fiber.props.children` 获取都，对于函数组件，我们手动执行 `fiber.type` 函数，将 `fiber.props` 传入即可得到函数组件返回的 jsx 元素，这个元素就可以作为 children 丢给 reconcileChildren 处理
+
+```ts
+/**
+ * @description 更新函数组件
+ */
+function updateFunctionComponent(fiber: Fiber) {
+  const children = [(fiber.type as JSXElementConstructor<any>)(fiber.props)]
+  reconcileChildren(fiber, children)
+}
+```
+
+### 7.5. 思考如何函数组件 fiber 的 DOM 问题？
+
+目前 createDOM 的调用只有在 `updateHostComponent` 函数中存在，也就是说只对普通 jsx 元素会为其创建 DOM，对于函数组件，我们还不支持创建 DOM
+
+或许你会想着，我们去修改 createDOM 的实现，让它支持为函数组件创建 DOM，然后再在 `updateFunctionComponent` 中调用 `createDOM` 不就好了吗？
+
+但你想一下，createDOM 的作用是什么？是不是根据传入的 type 调用原生 `document.createElement` 去创建原生标签的 DOM 元素？
+
+但是我们的函数组件标签名就是函数名，比如这里的 App 函数组件名，将其作为 `document.createElement` 并没有任何意义，我们使用的并不是 `WebComponent`，不支持自定义元素，因此我们应该转换一下思路，不是去对 createDOM 动手
+
+我们可以思考一下，如果函数组件对应的 fiber.dom 属性为 null，会影响到什么地方？
+
+没错，会影响到 `commitWork`！我们再来回顾一下 `commitWork` 的代码
+
+```ts
+function commitWork(fiber: Fiber) {
+  // base case
+  if (!fiber) return
+
+  const parentDOM = fiber.parent.dom
+
+  if (fiber.effectTag === 'UPDATE' && fiber.dom !== null) {
+    // 更新 -- 传入新旧 fiber 的 props，并找出变化的部分去修改 DOM
+    updateDOM(fiber.dom, fiber.alternate.props, fiber.props)
+  }
+
+  if (fiber.effectTag === 'PLACEMENT' && fiber.dom !== null) {
+    // 新增
+    parentDOM.appendChild(fiber.dom)
+  }
+
+  if (fiber.effectTag === 'DELETION') {
+    // 删除
+    parentDOM.removeChild(fiber.dom)
+  }
+
+  // 递归地将 fiber child 和 sibling 渲染到视图上
+  commitWork(fiber.child)
+  commitWork(fiber.sibling)
+}
+```
+
+第一次进来的时候，会尝试将函数组件的 fiber 渲染到视图，此时 parentDOM 是容器元素 `#root`，由于函数组件的 `fiber.dom === null`，因此下面对 fiber.effectTag 的处理不会起作用，然后递归 fiber.child，也就是 App 函数组件返回的 div 元素对应的 fiber
+
+![首次进入commitWork时的执行情况](https://p1-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/cb33aecfda96419a910c00030da9f923~tplv-k3u1fbpfcp-watermark.image?)
+
+我们的目的是将函数组件返回的这个 div 挂载到根容器 `#root` 上，并不是将它挂载到函数组件本身 `<App></App>` 这样的元素里面
+
+所以如果仍然用目前这个代码，parentDOM 会指向函数组件 fiber.dom，也就是 null，从而导致 div 无法顺利挂载，第二次进入 commitWork 的执行情况如下图所示：
+
+![第二次进入commitWork时的执行情况](https://p9-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/a36d863277de40a9ad765160268b215c~tplv-k3u1fbpfcp-watermark.image?)
+
+那么我们可以对 parentDOM 进行预处理，不断往 parent 寻找，直到找到 DOM 存在，比如这里就是找到 root fiber.dom，从而能够将 div 挂载到 root fiber.dom 也就是 `#root` 里面，这样才能根本上解决函数组件 DOM 不存在带来的问题
+
+**总而言之，只要我们搞清楚渲染的目的是将函数组件返回的 jsx 元素挂载到根容器`#root`中，而不是将函数组件 jsx 元素 `<App name='foo' />`本身挂载到 `#root`，那么这个问题就自然理解了**
+
+所以我们只需要作出下面这样一个简单的调整即可，让其就像访问链表一样不断沿着 parent 这个链表方向往上找，找到有 DOM 存在的 fiber，然后将元素挂载到这个 fiber.dom 下即可
+
+```ts
+// 寻找有 DOM 的父 fiber
+let parentFiberWithDOM = fiber.parent
+while (!parentFiberWithDOM.dom) {
+  parentFiberWithDOM = parentFiberWithDOM.parent
+}
+
+const parentDOM = parentFiberWithDOM.dom
+```
+
+![成功渲染](https://p9-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/15ddfa3509a04d7388a79e9c3cf1b09f~tplv-k3u1fbpfcp-watermark.image?)
+
+现在就能成功渲染这个函数组件啦~
+
+### 7.6. 函数组件卸载
+
+我们现在解决了挂载函数组件的问题，但是函数组件的卸载其实也是存在类似的问题的，你想想，我们要卸载 `<App />` 这个组件时，卸载的是 `<App />` 这个元素本身吗？
+
+显然并不是，我们卸载的是 App 函数返回的 `<div>` 元素，因此当 `commitWork` 遍历到 `<App />` 对应的 fiber 时，我们应该让它递归地去卸载 `fiber.child`，也就是 App 返回的 `<div>` 对应的 fiber 才对
+
+```ts
+function commitWork(fiber: Fiber) {
+  // ...
+
+  if (fiber.effectTag === 'DELETION') {
+    // 删除
+    commitDeletion(fiber, parentDOM)
+  }
+
+  // ...
+}
+
+/**
+ * @description 从容器 DOM 元素中删除 fiber 对应的 DOM
+ * @param fiber 待 commit 的 fiber
+ * @param parentDOM 容器 DOM 元素
+ */
+function commitDeletion(fiber: Fiber, parentDOM: DidactDOM) {
+  if (fiber.dom) {
+    parentDOM.removeChild(fiber.dom)
+  } else {
+    // 不存在 fiber.dom 说明当前 fiber 是函数组件对应的 fiber
+    // 需要删除其 child，也就是函数组件返回的 jsx 元素对应的 fiber
+    commitDeletion(fiber.child, parentDOM)
+  }
+}
+```
+
+至此，我们的函数组件就实现完啦~
+
+完整代码可自行 checkout `function-component` 分支查看~

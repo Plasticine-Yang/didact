@@ -1,6 +1,7 @@
 import {
   eventType,
   isEventPropertyKey,
+  isFunctionComponent,
   isGone,
   isNew,
   isProperty,
@@ -39,29 +40,6 @@ function render(element: DidactElement, container: HTMLElement) {
 }
 
 /**
- * @description 根据 fiber 创建 DOM
- * @param fiber Fiber
- */
-function createDOM(fiber: Fiber) {
-  const { type, props } = fiber
-
-  // 将 element 转成真实 DOM -- 需要注意对于文本节点类型的处理
-  const dom =
-    type === 'TEXT_ELEMENT'
-      ? document.createTextNode('')
-      : document.createElement(type)
-
-  // 把 element.props 赋值到 DOM 元素上
-  Object.keys(props)
-    .filter(isProperty)
-    .forEach((name) => {
-      dom[name] = props[name]
-    })
-
-  return dom
-}
-
-/**
  * @description 循环执行工作单元
  */
 function workLoop(deadline: IdleDeadline) {
@@ -91,15 +69,12 @@ function workLoop(deadline: IdleDeadline) {
  * @param fiber 工作单元
  */
 function performUnitOfWork(fiber: Fiber): Fiber | null {
-  // - 将 fiber 上的 DOM 添加到其父 fiber 的 DOM 中，也就是父 fiber 的 DOM 作为容器节点
-  if (!fiber.dom) {
-    // 不存在 dom 的则先创建 DOM
-    fiber.dom = createDOM(fiber)
-  }
-
   // - 遍历子元素 FiberChild 对象，依次为它们创建 fiber 对象，并将 fiber 对象加入到当前工作单元 fiber 中，逐步构造 fiber tree
-  const elements = fiber.props.children
-  reconcileChildren(fiber, elements)
+  if (isFunctionComponent(fiber)) {
+    updateFunctionComponent(fiber)
+  } else {
+    updateHostComponent(fiber)
+  }
 
   // - 寻找并返回下一个工作单元 fiber 对象
 
@@ -120,19 +95,62 @@ function performUnitOfWork(fiber: Fiber): Fiber | null {
 }
 
 /**
+ * @description 更新函数组件
+ */
+function updateFunctionComponent(fiber: Fiber) {
+  const children = [(fiber.type as JSXElementConstructor<any>)(fiber.props)]
+  reconcileChildren(fiber, children)
+}
+
+/**
+ * @description 更新 HostComponent -- 也就是 div、p 等原生标签类型
+ */
+function updateHostComponent(fiber: Fiber) {
+  if (!fiber.dom) {
+    // 不存在 dom 的则先创建 DOM
+    fiber.dom = createDOM(fiber)
+  }
+
+  reconcileChildren(fiber, fiber.props.children)
+}
+
+/**
+ * @description 根据 fiber 创建 DOM
+ * @param fiber Fiber
+ */
+function createDOM(fiber: Fiber) {
+  const { type, props } = fiber
+
+  // 将 element 转成真实 DOM -- 需要注意对于文本节点类型的处理
+  const dom =
+    type === 'TEXT_ELEMENT'
+      ? document.createTextNode('')
+      : document.createElement(type as string)
+
+  // 把 element.props 赋值到 DOM 元素上
+  Object.keys(props)
+    .filter(isProperty)
+    .forEach((name) => {
+      dom[name] = props[name]
+    })
+
+  return dom
+}
+
+/**
  * @description 调和 fiber children
  * @param wipFiber 新 fiber -- 由于尚未调和完毕，所以语义上命名为 wipFiber，即 work in progress fiber 更加合理
- * @param elements 待调和的 element
+ * @param children 待调和的 element
  */
-function reconcileChildren(wipFiber: Fiber, elements: FiberChild[]) {
+function reconcileChildren(wipFiber: Fiber, children: FiberChild[]) {
   // 旧 fiber 可以通过 alternate 属性获取 因为调和的是 children 所以要获取其子 fiber
   let oldFiber = wipFiber.alternate?.child
 
   // 记录前一个 sibling fiber -- 用于完善 fiber 之间的 sibling 引用指向
   let prevSibling: Fiber | null = null
 
-  for (let i = 0; i < elements.length; i++) {
-    const element = elements.at(i)
+  for (let i = 0; i < children.length; i++) {
+    const element = children.at(i)
 
     let newFiber: Fiber | null = null
 
@@ -213,7 +231,13 @@ function commitWork(fiber: Fiber) {
   // base case
   if (!fiber) return
 
-  const parentDOM = fiber.parent.dom
+  // 寻找有 DOM 的父 fiber
+  let parentFiberWithDOM = fiber.parent
+  while (!parentFiberWithDOM.dom) {
+    parentFiberWithDOM = parentFiberWithDOM.parent
+  }
+
+  const parentDOM = parentFiberWithDOM.dom
 
   if (fiber.effectTag === 'UPDATE' && fiber.dom !== null) {
     // 更新 -- 传入新旧 fiber 的 props，并找出变化的部分去修改 DOM
@@ -227,7 +251,7 @@ function commitWork(fiber: Fiber) {
 
   if (fiber.effectTag === 'DELETION') {
     // 删除
-    parentDOM.removeChild(fiber.dom)
+    commitDeletion(fiber, parentDOM)
   }
 
   // 递归地将 fiber child 和 sibling 渲染到视图上
@@ -278,6 +302,21 @@ function updateDOM(
     .forEach((name) => {
       dom.addEventListener(eventType(name), nextProps[name])
     })
+}
+
+/**
+ * @description 从容器 DOM 元素中删除 fiber 对应的 DOM
+ * @param fiber 待 commit 的 fiber
+ * @param parentDOM 容器 DOM 元素
+ */
+function commitDeletion(fiber: Fiber, parentDOM: DidactDOM) {
+  if (fiber.dom) {
+    parentDOM.removeChild(fiber.dom)
+  } else {
+    // 不存在 fiber.dom 说明当前 fiber 是函数组件对应的 fiber
+    // 需要删除其 child，也就是函数组件返回的 jsx 元素对应的 fiber
+    commitDeletion(fiber.child, parentDOM)
+  }
 }
 
 export { render }
