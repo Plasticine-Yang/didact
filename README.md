@@ -963,3 +963,595 @@ function commitWork(fiber: Fiber) {
 ![render和commit分离后的效果.gif](https://p1-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/ab312002895d4891a46088878a1696d9~tplv-k3u1fbpfcp-watermark.image?)
 
 可以看到，开始的时候白屏是因为在构建 fiber tree，等 fiber tree 构建好后，会一次性被 commitRoot 将其渲染到视图上，符合我们的预期
+
+## 6. Reconciliation
+
+我们现在实现了对 DidactElement 的首次渲染，接下来还需要去实现对 DidactElement 的更新和移除
+
+#### 6.1. 思路分析 -- 引入 currentRoot
+
+首先我们要明确一下更新的思路，是不是应该尽可能地去复用我们的 fiber，最好是只更新变化的那部分，对于变化的那部分 fiber，我们可以让他们重新生成 DOM，而对于没有发生变化的 fiber，实际上可以直接复用已有的 DOM
+
+为了做到这一点，我们应当实现一个 diff 算法，能够比对新旧 fiber，找出它们变化的 child，重新构造 fiber tree，并再处理完后将新的 fiber tree 提交给 commitRoot 去处理
+
+既然如此，我们目前的重点就是去实现 diff 算法，而 diff 算法首先肯定要获取到新旧 fiber tree 才能比对新旧 fiber tree 中发生变化的 child 有哪些
+
+新的 fiber tree 可以通过 render 函数调用时传入的 element 去生成，而老的 fiber tree 则可以利用闭包保留执行上下文环境的特性，每次 commit 结束时将 fiber tree 保留起来，方便下次更新时 diff 算法去使用
+
+为此我们需要添加一个自由变量 `currentRoot`，它用于记录上次 commit 的 fiber tree 的 fiber root
+
+```ts
+/** @description 记录最后一次 commit 的 fiber tree 的 root fiber */
+let currentRoot: Fiber | null = null
+```
+
+还要在每次 commitWork 结束的时候更新 currentRoot
+
+```ts
+/**
+ * @description commit 阶段入口 -- 将生成的完整 fiber tree 渲染到视图上
+ */
+function commitRoot() {
+  // 将生成的完整 fiber tree 渲染到视图上
+  commitWork(wipRoot.child)
+
+  // 更新 currentRoot
+  currentRoot = wipRoot
+
+  // 将已 commit 的 fiber tree 置空，表明其已经被 commit 过了
+  wipRoot = null
+}
+```
+
+### 6.2. 引入 alternate
+
+光是能够获取到新旧 fiber tree 还不够，在我们生成新 fiber tree 的过程中，我们需要找出其对应的旧 fiber 节点，方便做节点之间的 diff，因此还需要在每次 commit fiber 的时候添加一个新的属性 -- `alternate`
+
+因为是在 commit 阶段添加该属性的，这也就意味着在下次 commit 的时候访问该属性拿到的就是当前新 fiber 对应的旧 fiber 节点了
+
+通过以上分析，我们给 Fiber 类型添加一个 alternate 属性，目前我们的 Fiber 长这样：
+
+```ts
+interface Fiber<T extends string = string> {
+  child: Fiber | null
+  sibling: Fiber | null
+  parent: Fiber | null
+
+  /** @description 用于通过 fiber 创建 DOM 使用 */
+  dom: HTMLElement | Text | null
+
+  // 为了方便让 createDOM 将原来的 element 转成 DOM 逻辑复用，因此让 fiber 的结构和 element 保持一致
+  type: T
+
+  props: {
+    /** @description 用于为 children element 创建 fiber 对象使用 */
+    children: FiberChild[]
+  }
+
+  /** @description 每个 fiber 对应的旧 fiber */
+  alternate: Fiber | null
+}
+```
+
+在什么时候赋值这个 alternate 属性呢？
+
+首先对于 fiber root 来说，应当在创建 fiber root 的时候就赋值该属性了，也就是在 render 函数中
+
+而语义上 fiber root 的 alternate 指的是最后依次 commit 时的 fiber root，那不就是自由变量 currentRoot 的值吗！
+
+因此我们在 render 函数中修改如下：
+
+```diff
+function render(element: DidactElement, container: HTMLElement) {
+  // 创建 root fiber
+  wipRoot = {
+    child: null,
+    parent: null,
+    sibling: null,
+    dom: container,
+    type: 'ROOT_ELEMENT',
+    props: {
+      children: [element],
+    },
++   alternate: currentRoot,
+  }
+
+  nextUnitOfWork = wipRoot
+
+  requestIdleCallback(workLoop)
+}
+```
+
+### 6.3. 怎么理解 reconciliation 调和？
+
+其次，对于 child fiber，应当在遍历 elments 生成 fiber 对象的时候去添加 alternate 属性，也就是在 performUnitOfWork 函数中，但是这里我们不急着做这一步先，先停下来重构一下我们的代码，因为目前 performUnitOfWork 的代码有点长了，并且语义上现在是可以拆分的
+
+也就是这个遍历 elements 生成 fiber tree 的过程实际上是一个调和(reconciliation)过程，调和是什么意思？我个人的理解就是让新旧 fiber tree 最大程度上保持一致，保持协调的过程，怎么理解呢？
+
+也就是说生成新 fiber 的时候我们要尽可能复用旧 fiber 上已有的信息，让它们两者协调商量一下，把能用的都用上，避免重复劳动，比如旧 fiber 上保留有对应 DOM 的引用，而新 fiber 中如果发现对应的 DOM 其实没必要重新生成的话，直接将旧 fiber 的 dom 引用拿过来即可，不需要重新调用 DOM API 去生成一个一模一样的 DOM
+
+综上所述，我们将 performUnitOfWork 的第二步 `遍历子元素 FiberChild 对象，依次为它们创建 fiber 对象，并将 fiber 对象加入到当前工作单元 fiber 中，逐步构造 fiber tree` 抽离成一个名为 `reconcileChildren` 的函数，在这里面专门负责调和新旧 fiber，这样能够提高我们代码的可读性，但前提是你要搞懂这些函数命名的意义才行
+
+> 事实上重构前的代码也可以看成是一个调和的过程，只是没有旧 fiber 供它协调，因此全都只能自己单干
+
+```ts
+function performUnitOfWork(fiber: Fiber): Fiber | null {
+  // - 将 fiber 上的 DOM 添加到其父 fiber 的 DOM 中，也就是父 fiber 的 DOM 作为容器节点
+  // ...
+
+  // - 遍历子元素 FiberChild 对象，依次为它们创建 fiber 对象，并将 fiber 对象加入到当前工作单元 fiber 中，逐步构造 fiber tree
+  const elements = fiber.props.children
+  reconcileChildren(fiber, elements)
+
+  // - 寻找并返回下一个工作单元 fiber 对象
+  // ...
+}
+
+/**
+ * @description 调和 fiber children
+ * @param wipFiber 新 fiber -- 由于尚未调和完毕，所以语义上命名为 wipFiber，即 work in progress fiber 更加合理
+ * @param elements 待调和的 element
+ */
+function reconcileChildren(wipFiber: Fiber, elements: FiberChild[]) {
+  // 记录前一个 sibling fiber -- 用于完善 fiber 之间的 sibling 引用指向
+  let prevSibling: Fiber | null = null
+
+  for (let i = 0; i < elements.length; i++) {
+    const element = elements.at(i)
+
+    // 为 element 创建 fiber 对象
+    const newFiber: Fiber = {
+      type: element.type,
+      props: element.props,
+      child: null,
+      parent: wipFiber,
+      sibling: null,
+      dom: null,
+    }
+
+    // 完善 fiber 指向关系
+    if (i === 0) {
+      // 第一个子元素对应的 newFiber 作为 fiber.child
+      wipFiber.child = newFiber
+    } else {
+      // 后续子元素依次作为前一个子元素的 sibling
+      prevSibling.sibling = newFiber
+    }
+
+    // 当前创建的 newFiber 在下一次循环中作为下一个 fiber 的 prevSibling
+    prevSibling = newFiber
+  }
+}
+```
+
+### 6.4. effectTag
+
+现在我们在 reconcileChildren 中可以获取到旧 fiber 以及待调和的 element，我们需要判断一下接下来需要对 element 做什么操作
+
+无非就三种操作：
+
+1. 更新
+2. 新增
+3. 删除
+
+问题是我们要如何知道接下来要进行这三种操作的哪一种呢？我们来分类讨论一下：
+
+#### 6.4.1. 何时更新？
+
+何时需要更新？是不是只对旧 fiber 的 type 和待调和的 element 的 type 是同一个 type 的时候才有更新的必要？
+
+比如旧 fiber 上的 type 是 div，在新的 element 中变成了 p，这种情况就没有更新的必要，因为旧 fiber 上的 dom 属性我们是不能复用的，没有复用的意义
+
+只有当旧 fiber 上的 type 是 div，并且新的 element 中也仍然是 div 时才有更新的意义
+
+#### 6.4.2. 何时新增？
+
+何时需要新增？这个就简单了，如果旧 fiber 直接不存在，那这个时候 element 不就只有新增这一条路可以走了吗
+
+#### 6.4.3. 何时删除？
+
+何时需要删除？这个也很简单，如果旧 fiber 存在，且 element 不存在，则说明需要从视图上删除这个旧 fiber 对应的 DOM
+
+### 6.5. 实现
+
+#### 6.5.1. 扩展 Fiber 类型定义
+
+通过以上的分析，我们能够知道何时做什么操作了，但是要代码也知道才行呀，所以我们现在又要给 fiber 拓展新的属性了
+
+新增一个 `effectTag` 属性，并且我们约定：
+
+- 需要更新时 effectTag 赋值为 `UPDATE`
+- 需要新增时 effectTag 赋值为 `PLACEMENT`
+- 需要删除时 effectTag 赋值为 `DELETION`
+
+结合上面的分类讨论，我们通过三个分支去为 fiber 添加对应的 effectTag
+
+但是这里要注意，对于更新和新增才有为 element 创建新 fiber 的必要，此时 effectTag 要放在新生成 fiber 上
+
+而对于删除操作，并没有创建新 fiber 的必要，所以 effectTag 要放在旧 fiber 上
+
+之后我们会统一在 commitWork 中通过 fiber 获取到 effectTag，从而知道要如何处理这个 fiber 对应的 DOM
+
+我们先来修改 Fiber 的类型定义，添加 effectTag 属性
+
+```ts
+interface Fiber<T extends string = string> {
+  child: Fiber | null
+  sibling: Fiber | null
+  parent: Fiber | null
+
+  /** @description 用于通过 fiber 创建 DOM 使用 */
+  dom: HTMLElement | Text | null
+
+  // 为了方便让 createDOM 将原来的 element 转成 DOM 逻辑复用，因此让 fiber 的结构和 element 保持一致
+  type: T
+
+  props: {
+    /** @description 用于为 children element 创建 fiber 对象使用 */
+    children: FiberChild[]
+  }
+
+  /** @description 每个 fiber 对应的旧 fiber */
+  alternate: Fiber | null
+
+  /** @description commit 阶段要如何处理 fiber */
+  effectTag: 'UPDATE' | 'PLACEMENT' | 'DELETION' | null
+}
+```
+
+还需要在创建 fiber root 的时候初始化一下 effectTag
+
+```ts
+function render(element: DidactElement, container: HTMLElement) {
+  // 创建 root fiber
+  wipRoot = {
+    child: null,
+    parent: null,
+    sibling: null,
+    dom: container,
+    type: 'ROOT_ELEMENT',
+    props: {
+      children: [element],
+    },
+    alternate: currentRoot,
+    effectTag: null,
+  }
+
+  nextUnitOfWork = wipRoot
+
+  requestIdleCallback(workLoop)
+}
+```
+
+#### 6.5.2. 给 fiber 打上 effectTag
+
+为了方便判断对 element 的操作，先来实现一个判断旧 fiber 和待调和 element 是否是同一 type 的工具函数
+
+```ts
+/** @description 检验新旧 fiber 是否是同一类型 为后续需要执行何种操作提供依据 */
+const sameType = oldFiber && element && element.type === oldFiber.type
+```
+
+然后就是通过三个条件分支去创建 fiber 和设置 effectTag 属性了
+
+```ts
+let newFiber: Fiber | null = null
+
+if (sameType) {
+  // TODO 更新
+}
+
+if (element && !sameType) {
+  // TODO 新增
+}
+
+if (oldFiber && !sameType) {
+  // TODO 删除
+}
+```
+
+##### 6.5.2.1. UPDATE effectTag
+
+对于更新操作，我们需要为待调和 element 创建新的 fiber 对象，并打上 'UPDATE' effectTag
+
+```ts
+if (sameType) {
+  // 更新
+  newFiber = {
+    child: null,
+    sibling: null,
+    parent: wipFiber,
+
+    // 复用旧 fiber 的 dom
+    dom: oldFiber.dom,
+    type: oldFiber.type,
+    props: element.props,
+    alternate: oldFiber,
+    effectTag: 'UPDATE',
+  }
+}
+```
+
+##### 6.5.2.2. PLACEMENT effectTag
+
+对于新增操作，我们也需要为待调和 element 创建 fiber 对象，并打上 `PLACEMENT` effectTag
+
+```ts
+if (element && !sameType) {
+  // 新增
+  newFiber = {
+    child: null,
+    sibling: null,
+    parent: wipFiber,
+    dom: null,
+    type: element.type,
+    props: element.props,
+    alternate: null,
+    effectTag: 'PLACEMENT',
+  }
+}
+```
+
+##### 6.5.2.3. DELETION effectTag
+
+对于删除操作，我们不用创建新 fiber，只用给旧 fiber 打上 'DELETION' effectTag 即可
+
+```ts
+if (oldFiber && !sameType) {
+  // 删除
+  oldFiber.effectTag = 'DELETION'
+}
+```
+
+至此，我们的 reconcileChildren 函数完整代码如下：
+
+```ts
+/**
+ * @description 调和 fiber children
+ * @param wipFiber 新 fiber -- 由于尚未调和完毕，所以语义上命名为 wipFiber，即 work in progress fiber 更加合理
+ * @param elements 待调和的 element
+ */
+function reconcileChildren(wipFiber: Fiber, elements: FiberChild[]) {
+  // 旧 fiber 可以通过 alternate 属性获取 因为调和的是 children 所以要获取其子 fiber
+  let oldFiber = wipFiber.alternate?.child
+
+  // 记录前一个 sibling fiber -- 用于完善 fiber 之间的 sibling 引用指向
+  let prevSibling: Fiber | null = null
+
+  for (let i = 0; i < elements.length; i++) {
+    const element = elements.at(i)
+
+    let newFiber: Fiber | null = null
+
+    /** @description 检验新旧 fiber 是否是同一类型 为后续需要执行何种操作提供依据 */
+    const sameType = oldFiber && element && element.type === oldFiber.type
+
+    if (sameType) {
+      // 更新
+      newFiber = {
+        child: null,
+        sibling: null,
+        parent: wipFiber,
+
+        // 复用旧 fiber 的 dom
+        dom: oldFiber.dom,
+        type: oldFiber.type,
+        props: element.props,
+        alternate: oldFiber,
+        effectTag: 'UPDATE',
+      }
+    }
+
+    if (element && !sameType) {
+      // 新增
+      newFiber = {
+        child: null,
+        sibling: null,
+        parent: wipFiber,
+        dom: null,
+        type: element.type,
+        props: element.props,
+        alternate: null,
+        effectTag: 'PLACEMENT',
+      }
+    }
+
+    if (oldFiber && !sameType) {
+      // 删除
+      oldFiber.effectTag = 'DELETION'
+    }
+
+    // 完善 fiber 指向关系
+    if (i === 0) {
+      // 第一个子元素对应的 newFiber 作为 fiber.child
+      wipFiber.child = newFiber
+    } else {
+      // 后续子元素依次作为前一个子元素的 sibling
+      prevSibling.sibling = newFiber
+    }
+
+    // 当前创建的 newFiber 在下一次循环中作为下一个 fiber 的 prevSibling
+    prevSibling = newFiber
+  }
+}
+```
+
+#### 6.5.3. commitWork 中根据 effectTag 做出不同操作
+
+打上 effectTag 后，我们就能在 commit 阶段对 fiber 进行处理了
+
+##### 6.5.3.1. UPDATE effectTag -- 简单 diff 算法
+
+对于更新操作，算是整个 didact 中最复杂的部分了，所以我们抽出单独的一个函数去处理更新逻辑
+
+```ts
+function commitWork(fiber: Fiber) {
+  // base case
+  if (!fiber) return
+
+  const parentDOM = fiber.parent.dom
+
+  if (fiber.effectTag === 'UPDATE' && fiber.dom !== null) {
+    // 更新 -- 传入新旧 fiber 的 props，并找出变化的部分去修改 DOM
+    updateDOM(fiber.dom, fiber.alternate.props, fiber.props)
+  }
+
+  // 递归地将 fiber child 和 sibling 渲染到视图上
+  commitWork(fiber.child)
+  commitWork(fiber.sibling)
+}
+
+/**
+ * @description 找出新旧 fiber props 的 difference 后更新已有 DOM
+ * @param dom 已有 DOM
+ * @param prevProps 旧 fiber 的 props
+ * @param nextProps 新 fiber 的 props
+ */
+function updateDOM(
+  dom: DidactDOM,
+  prevProps: Fiber['props'],
+  nextProps: Fiber['props'],
+) {
+  // TODO
+}
+
+type DidactDOM = HTMLElement | Text
+```
+
+updateDOM 中会进行一个简单的 diff 算法，大致逻辑如下：
+
+1. 遍历旧 props 中的 event props，也就是诸如`onClick`、`onChange`这样的 property，移除不存在于新 props 中或者发生变化了的的这些 event props，并且要移除相应的事件监听器
+2. 遍历旧 props，移除不存在于新 props 的 property
+3. 遍历新 props，添加不存在于旧 props 的 property
+4. 遍历新 props 中的 event props，添加不存在于旧 props 中的这些 event props，并添加相应的事件监听器
+
+我们一步一步来实现，首先处理第 2、3 点，它们比较简单
+
+```ts
+// 遍历旧 props，移除不存在于新 props 的 property
+Object.keys(prevProps)
+  .filter(isProperty)
+  .filter(isGone(nextProps))
+  .forEach((name) => {
+    dom[name] = ''
+  })
+
+// 遍历新 props，添加不存在于旧 props 的 property
+Object.keys(nextProps)
+  .filter(isProperty)
+  .filter(isNew(prevProps))
+  .forEach((name) => {
+    dom[name] = nextProps[name]
+  })
+```
+
+这里有三个工具函数，`isProperty`、`isGone`、`isNew`
+
+```ts
+/** @description 判断是否是有效的 property */
+const isProperty = (key: string) => key !== 'children'
+
+/** @description 判断是否是新 props 中不存在的 property */
+const isGone = (nextProps: Fiber['props']) => (key: string) =>
+  !(key in nextProps)
+
+/** @description 判断是否是旧 props 中不存在的 property */
+const isNew = (prevProps: Fiber['props']) => (key: string) =>
+  !(key in prevProps)
+```
+
+接下来是第 1、4 步
+
+```ts
+// 遍历旧 props 中的 event props，也就是诸如`onClick`、`onChange`这样的 property
+// 移除不存在于新 props 中或者发生变化了的的这些 event props，并且要移除相应的事件监听器
+Object.keys(prevProps)
+  .filter(isEventPropertyKey)
+  .filter((key) => !(key in nextProps) || isNew(prevProps)(key))
+  .forEach((name) => {
+    dom.removeEventListener(eventType(name), prevProps[name])
+  })
+
+// 遍历新 props 中的 event props，添加不存在于旧 props 中的这些 event props，并添加相应的事件监听器
+Object.keys(nextProps)
+  .filter(isEventPropertyKey)
+  .filter(isNew(prevProps))
+  .forEach((name) => {
+    dom.addEventListener(eventType(name), nextProps[name])
+  })
+```
+
+这里又出现了新的工具函数：`isEventPropertyKey` 和 `eventType`，并且对 `isProperty` 进行了调整
+
+```ts
+/** @description 判断是否是事件属性名 */
+const isEventPropertyKey = (key: string) => key.startsWith('on')
+
+/** @description 获取事件属性名 */
+const eventType = (name: string) => name.toLowerCase().substring(2)
+
+/** @description 判断是否是有效的 property */
+const isProperty = (key: string) =>
+  key !== 'children' && !isEventPropertyKey(key)
+```
+
+##### 6.5.3.2. PLACEMENT effectTag
+
+在 commitWork 中继续添加对新增操作的处理
+
+```ts
+if (fiber.effectTag === 'PLACEMENT' && fiber.dom !== null) {
+  // 新增
+  parentDOM.appendChild(fiber.dom)
+}
+```
+
+##### 6.5.3.3. DELETION effectTag
+
+同样在 commitWork 中继续添加对删除操作的处理
+
+```ts
+if (fiber.effectTag === 'DELETION') {
+  // 删除
+  parentDOM.removeChild(fiber.dom)
+}
+```
+
+但是这里有个问题，思考一下，`DELETION`这个 effectTag 是不是在 reconcileChildren 的时候将其打在了旧 fiber tree 中，我们现在 commitWork 处理的是新 fiber tree，所以不可能获取到被打上 `DELETEION` effectTag 的 fiber，因此我们要额外维护一个 `deletions` 数组，记录需要删除的 fiber，并在打上 `DELETION` effectTag 的时候将 fiber 加入到 deletions 数组中
+
+```ts
+/** @description 记录需要被删除的 fiber */
+let deletions: Fiber[] = []
+
+function reconcileChildren(wipFiber: Fiber, elements: FiberChild[]) {
+  // ...
+
+  if (oldFiber && !sameType) {
+    // 删除
+    oldFiber.effectTag = 'DELETION'
+    deletions.push(oldFiber)
+  }
+
+  // ...
+}
+```
+
+然后在 commit 阶段入口将 deletions 中的 fiber 逐一删除，也就是在 commitRoot 中处理
+
+```ts
+function commitRoot() {
+  // 将 deletions 中的 fiber 删除
+  deletions.forEach(commitWork)
+
+  // 将生成的完整 fiber tree 渲染到视图上
+  commitWork(wipRoot.child)
+
+  // 更新 currentRoot
+  currentRoot = wipRoot
+
+  // 将已 commit 的 fiber tree 置空，表明其已经被 commit 过了
+  wipRoot = null
+}
+```
+
+至此，我们的 reconciliation 就算完成啦

@@ -1,0 +1,1 @@
+type DidactDOM = HTMLElement | Text
