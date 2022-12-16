@@ -3,9 +3,12 @@ import { isProperty } from './utils'
 /** @description 记录下一个工作单元 -- 供 workLoop 函数调度 */
 let nextUnitOfWork: Fiber | null = null
 
+/** @description 记录执行的 fiber tree 的 root fiber */
+let wipRoot: Fiber | null = null
+
 function render(element: DidactElement, container: HTMLElement) {
   // 创建 root fiber
-  nextUnitOfWork = {
+  wipRoot = {
     child: null,
     parent: null,
     sibling: null,
@@ -15,6 +18,8 @@ function render(element: DidactElement, container: HTMLElement) {
       children: [element],
     },
   }
+
+  nextUnitOfWork = wipRoot
 
   requestIdleCallback(workLoop)
 }
@@ -58,6 +63,11 @@ function workLoop(deadline: IdleDeadline) {
     }
   }
 
+  // 工作单元执行结束后判断是否生成了完整的 fiber tree，是的话进入 commit 阶段
+  if (!nextUnitOfWork && wipRoot) {
+    commitRoot()
+  }
+
   // 剩下的工作单元放到之后的时间片中处理
   requestIdleCallback(workLoop)
 }
@@ -71,11 +81,6 @@ function performUnitOfWork(fiber: Fiber): Fiber | null {
   if (!fiber.dom) {
     // 不存在 dom 的则先创建 DOM
     fiber.dom = createDOM(fiber)
-  }
-
-  if (fiber.parent) {
-    // 上面对 fiber.dom 的预处理能够保证父 fiber 一定会有 DOM
-    fiber.parent.dom!.appendChild(fiber.dom)
   }
 
   // - 遍历子元素 FiberChild 对象，依次为它们创建 fiber 对象，并将 fiber 对象加入到当前工作单元 fiber 中，逐步构造 fiber tree
@@ -126,6 +131,33 @@ function performUnitOfWork(fiber: Fiber): Fiber | null {
 
   // 最后回到 root fiber 时，nextFiber 会指向 root fiber 的 parent，也就是 null
   return nextFiber
+}
+
+/**
+ * @description commit 阶段入口 -- 将生成的完整 fiber tree 渲染到视图上
+ */
+function commitRoot() {
+  // 将生成的完整 fiber tree 渲染到视图上
+  commitWork(wipRoot.child)
+
+  // 将已 commit 的 fiber tree 置空，表明其已经被 commit 过了
+  wipRoot = null
+}
+
+/**
+ * @description 将 fiber 对应的 DOM 渲染到视图上
+ */
+function commitWork(fiber: Fiber) {
+  // base case
+  if (!fiber) return
+
+  // 将当前 fiber 渲染到视图上
+  const parentDOM = fiber.parent.dom
+  parentDOM.appendChild(fiber.dom)
+
+  // 递归地将 fiber child 和 sibling 渲染到视图上
+  commitWork(fiber.child)
+  commitWork(fiber.sibling)
 }
 
 export { render }

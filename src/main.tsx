@@ -1,14 +1,10 @@
 import Didact from './core'
+import { renderBenchmark } from './examples/render-benchmark'
 
-/** @jsx Didact.createElement */
-const el = (
-  <div>
-    <h1>
-      <p />
-      <a />
-    </h1>
-
-    <h2 />
-  </div>
-)
-Didact.render(el, document.getElementById('root'))
+renderBenchmark({
+  nodeCount: 10000,
+  minNestedLevel: 30,
+  maxNestedLevel: 100,
+  hostCreateElement: Didact.createElement,
+  hostRender: Didact.render,
+})

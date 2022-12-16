@@ -817,3 +817,149 @@ function performUnitOfWork(fiber: Fiber): Fiber | null {
 ![渲染结果](https://p1-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/e9594fe663ff407382d17204d176299b~tplv-k3u1fbpfcp-watermark.image?)
 
 也是符合我们在 `main.tsx` 中编写的 tsx 结构的
+
+## 5. render 和 commit 分离
+
+### 5.1. 目前存在的问题
+
+目前我们的 performUnitOfWork 中是边构造 fiber tree 边将生成的 DOM 挂载到容器节点中从而触发浏览器渲染，这样带来的一个严重问题就是在渲染复杂结构的 fiber tree 时，fiber tree 还没生成完就已经开始渲染了，也就是说用户会看到一个不完整的 UI
+
+```ts
+function performUnitOfWork(fiber: Fiber): Fiber | null {
+  // ...
+
+  // fiber tree 构造的过程中夹杂着将 DOM 渲染到浏览器的过程
+  if (fiber.parent) {
+    fiber.parent.dom!.appendChild(fiber.dom)
+  }
+
+  // - 遍历子元素 FiberChild 对象，依次为它们创建 fiber 对象，并将 fiber 对象加入到当前工作单元 fiber 中，逐步构造 fiber tree
+}
+```
+
+比如我们拿之前我们写的 renderBenchmark 测试一下，渲染 10000 个 30 到 100 层嵌套结构的 DOM 元素
+
+```tsx
+renderBenchmark({
+  nodeCount: 10000,
+  minNestedLevel: 30,
+  maxNestedLevel: 100,
+  hostCreateElement: Didact.createElement,
+  hostRender: Didact.render,
+})
+```
+
+![render和commit不分离的问题.gif](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/2009278b831049dd95533e2c2e526318~tplv-k3u1fbpfcp-watermark.image?)
+
+注意看右侧的滚动条，作为用户在浏览 UI 的时候，UI 还在动态生成，这样的用户体验不太好
+
+为此，React 采用了构造 fiber tree 和 浏览器渲染分离的策略，我们把构造 fiber tree 视为 render，浏览器渲染视为将生成的 fiber tree 渲染到视图上，也称为 commit
+
+也就是将原来的 render 函数拆分成 render 和 commit 阶段，前者负责构造 fiber tree，执行的都是一些 js 操作，后者负责提交生成的 fiber tree，使其渲染到浏览器视图上
+
+### 5.2. 引入 wipRoot
+
+首先，我们要把真实 DOM 操作的代码从 render 函数中移除。
+
+其次，因为我们的 fiber tree 生成的过程是可中断的，为了保证在下次恢复执行时能够继续找到上次执行的 fiber tree 的 root fiber，我们需要利用闭包保存执行上下文环境的特性，声明一个 wipRoot 自由变量，让其指向执行的 fiber tree 的 root fiber
+
+```ts
+/** @description 记录执行的 fiber tree 的 root fiber */
+let wipRoot: Fiber | null = null
+
+function render(element: DidactElement, container: HTMLElement) {
+  // 创建 root fiber
+  wipRoot = {
+    child: null,
+    parent: null,
+    sibling: null,
+    dom: container,
+    type: 'ROOT_ELEMENT',
+    props: {
+      children: [element],
+    },
+  }
+
+  nextUnitOfWork = wipRoot
+
+  requestIdleCallback(workLoop)
+}
+```
+
+### 5.3. commitRoot
+
+我们需要在 fiber tree 生成完成后进入 commit 阶段，通过调用 commitRoot 函数进入 commit 阶段，那么 commitRoot 函数应该在哪里调用呢？
+
+只需要搞清楚何时生成完整的 fiber tree 即可，很显然是当遍历回 fiber root 的时候就代表整个 fiber tree 生成完了，此时 nextUnitOfWork 是 null，因此我们可以在 workLoop 中判断 nextUnitOfWork 不存在时执行 commitRoot
+
+但是还有一点要注意，单纯判断 nextUnitOfWork 存在还不够，我们还要确保 commitRoot 的操作对象存在，也就是 wipRoot 要存在才行，因此改进的代码如下：
+
+```ts
+function workLoop(deadline: IdleDeadline) {
+  let shouldYield = false
+
+  while (nextUnitOfWork && !shouldYield) {
+    // 执行工作单元并生成下一个工作单元
+    nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
+
+    // 时间片的剩余时间不足时将控制权交回给浏览器
+    if (deadline.timeRemaining() < 1) {
+      shouldYield = true
+    }
+  }
+
+  // 工作单元执行结束后判断是否生成了完整的 fiber tree，是的话进入 commit 阶段
+  if (!nextUnitOfWork && wipRoot) {
+    commitRoot()
+  }
+
+  // 剩下的工作单元放到之后的时间片中处理
+  requestIdleCallback(workLoop)
+}
+
+/**
+ * @description commit 阶段入口 -- 将生成的完整 fiber tree 渲染到视图上
+ */
+function commitRoot() {
+  // TODO 将生成的完整 fiber tree 渲染到视图上
+}
+```
+
+在 commitRoot 中，我们会递归地将 child 和 sibling 都渲染到视图上，所以我们还需要一个递归子函数 commitWork 去负责真正的渲染操作
+
+并且在每次 commit 完成之后，应当将 wipRoot 置为 null，表明其已经被 commit 过
+
+```ts
+/**
+ * @description commit 阶段入口 -- 将生成的完整 fiber tree 渲染到视图上
+ */
+function commitRoot() {
+  // 将生成的完整 fiber tree 渲染到视图上
+  commitWork(wipRoot.child)
+
+  // 将已 commit 的 fiber tree 置空，表明其已经被 commit 过了
+  wipRoot = null
+}
+
+/**
+ * @description 将 fiber 对应的 DOM 渲染到视图上
+ */
+function commitWork(fiber: Fiber) {
+  // base case
+  if (!fiber) return
+
+  // 将当前 fiber 渲染到视图上
+  const parentDOM = fiber.parent.dom
+  parentDOM.appendChild(fiber.dom)
+
+  // 递归地将 fiber child 和 sibling 渲染到视图上
+  commitWork(fiber.child)
+  commitWork(fiber.sibling)
+}
+```
+
+目前的渲染效果如下：
+
+![render和commit分离后的效果.gif](https://p1-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/ab312002895d4891a46088878a1696d9~tplv-k3u1fbpfcp-watermark.image?)
+
+可以看到，开始的时候白屏是因为在构建 fiber tree，等 fiber tree 构建好后，会一次性被 commitRoot 将其渲染到视图上，符合我们的预期
