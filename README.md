@@ -1822,3 +1822,213 @@ function commitDeletion(fiber: Fiber, parentDOM: DidactDOM) {
 至此，我们的函数组件就实现完啦~
 
 完整代码可自行 checkout `function-component` 分支查看~
+
+## 8. hooks
+
+目前我们虽然实现了函数组件，但还是不能触发更新和删除元素的操作，因此我们来实现我们的 Didact 的最后一步 -- hooks!
+
+本节的目标是实现渲染一个 `Counter` 组件：
+
+```tsx
+/** @jsx Didact.createElement */
+function Counter() {
+  const [count, setCount] = Didact.useState(0)
+
+  return (
+    <div onClick={() => setCount((c: number) => c + 1)}>Count: {count}</div>
+  )
+}
+
+Didact.render(<Counter />, document.getElementById('root'))
+```
+
+对于这个组件，我们只需要实现一个 `useState` 就足够了
+
+### 8.1. 扩展 Fiber 类型，添加 hooks 属性
+
+因为函数组件的每次渲染就意味着是一次重新执行函数，为了保证在处理 fiber 时能够保持着对函数组件对应 fiber 的 hooks 的执行状态的追踪
+
+我们应当给函数组件的 fiber 绑定一个 hooks 数组，记录函数组件执行过程中都使用了哪些 hooks，这样再处理 fiber 的时候就可以通过 hooks 属性获取到相关 hooks 一一进行调用
+
+所以我们先要给 Fiber 类型进行拓展
+
+```ts
+interface Fiber<
+  T extends string | JSXElementConstructor<any> =
+    | string
+    | JSXElementConstructor<any>,
+> {
+  child: Fiber | null
+  sibling: Fiber | null
+  parent: Fiber | null
+
+  /** @description 用于通过 fiber 创建 DOM 使用 */
+  dom: DidactDOM | null
+
+  // 为了方便让 createDOM 将原来的 element 转成 DOM 逻辑复用，因此让 fiber 的结构和 element 保持一致
+  type: T
+
+  props: {
+    /** @description 用于为 children element 创建 fiber 对象使用 */
+    children: FiberChild[]
+  }
+
+  /** @description 每个 fiber 对应的旧 fiber */
+  alternate: Fiber | null
+
+  /** @description commit 阶段要如何处理 fiber */
+  effectTag: 'UPDATE' | 'PLACEMENT' | 'DELETION' | null
+
+  /** @description 函数组件的 fiber 对应的 hooks */
+  hooks: any[] | null
+}
+```
+
+由于我们还不知道 hooks 具体是啥样的，所以先用 any 代替，之后明确了再回来修改
+
+### 8.2. wipFiber & hookIndex
+
+上面分析的时候也说了，需要保持对函数组件对应 fiber 的 hooks 执行状态记录，所以我们仍然是利用闭包保存执行上下文环境的特性，添加一个 wipFiber 用于记录执行的函数组件对应的 fiber
+
+并且在 fiber 上添加一个 hooks 数组，用于支持在函数组件中多次调用 useState
+
+并且添加一个 hookIndex 用于记录函数组件对应 fiber 的 hooks 数组中的 hook 执行到了哪一个
+
+```ts
+/** @description 记录当前正在工作的函数组件对应的 fiber */
+let wipFiber: Fiber | null = null
+
+/** @description 记录当前执行的 hook 的下标 */
+let hookIndex: number | null = null
+```
+
+其次，我们还要在每次函数组件调和之前，将这两个自由变量的值进行初始化
+
+```ts
+function updateFunctionComponent(fiber: Fiber) {
+  wipFiber = fiber
+  hookIndex = 0
+  wipFiber.hooks = []
+
+  const children = [(fiber.type as JSXElementConstructor<any>)(fiber.props)]
+  reconcileChildren(fiber, children)
+}
+```
+
+### 8.3. 实现 useState -- state
+
+做好了上面的准备工作后，接下来就可以实现 useState 了，具体实现看注释
+
+```ts
+interface UseStateHook<T> {
+  state: T
+}
+function useState<T>(initial: T) {
+  // 取出函数组件的旧 fiber 上的 hooks[hookIndex] 对应的 hook
+  const oldHook: UseStateHook<T> = wipFiber.alternate?.hooks?.[hookIndex]
+
+  // 尝试复用 oldHook 上的 state，没有的话则使用初始值
+  const hook = {
+    state: oldHook ? oldHook.state : initial,
+  }
+
+  // 将 hook 加入到当前执行的函数组件对应的 fiber 中
+  // 这样下次执行函数组件的时候就能够从其对应的 fiber 中获取到本次的 hook
+  wipFiber.hooks.push(hook)
+  hookIndex++
+
+  return [hook.state]
+}
+```
+
+### 8.4 实现 useState -- setState
+
+执行 setState，就意味着会触发函数组件的重新执行
+
+因此我们的 setState 中**需要修改 nextUnitOfWork，让其指向 wipRoot**，这样才能保证 workLoop 中能够检测到 nextUnitOfWork 从而触发更新流程
+
+否则 nextUnitOfWork 一直是指向 null 的，这就导致修改了 state 但是视图没有更新的现象
+
+还有一点，因为我们可能会在函数组件中多次调用同一个 useState 返回的 setState 函数，因此我们还需要在 useState 对应的 hook 对象上将多次 setState 的调用保存起来，并且需要依次取出它们执行，得到最终的状态 state
+
+综上，我们先抽象出一个 UseStateHook interface，用于描述 hook 对象长什么样
+
+```ts
+/** @description setState 的参数类型 */
+type SetStateAction<T> = (state: T) => T
+
+interface UseStateHook<T> {
+  /** @description hook 的 state */
+  state: T
+
+  /** @description 多次 setState 调用 */
+  queue: SetStateAction<T>[]
+}
+```
+
+具体实现代码如下：
+
+```ts
+function useState<T>(initial: T): [T, (action: SetStateAction<T>) => void] {
+  // 取出函数组件的旧 fiber 上的 hooks[hookIndex] 对应的 hook
+  const oldHook: UseStateHook<T> = wipFiber.alternate?.hooks?.[hookIndex]
+
+  const hook: UseStateHook<T> = {
+    // 尝试复用 oldHook 上的 state，没有的话则使用初始值
+    state: oldHook?.state ?? initial,
+
+    // 新 hook 中的 queue 初始化为空数组是因为旧 hook 对象上的 queue 被消费过后就没必要保存了
+    // 不初始化为空数组的话会导致每次的 setState 都被累积，但这是没必要的
+    queue: [],
+  }
+
+  // 消费 setState 的 action -- 改变 hook.state，多次 setState 会被合并为一次渲染
+  const actions = oldHook ? oldHook.queue : []
+  actions.forEach((action) => {
+    hook.state = action(hook.state)
+  })
+
+  const setState = (action: SetStateAction<T>) => {
+    hook.queue.push(action)
+
+    // 重新设置 wipRoot 和 nextUnitOfWork 以便让 workLoop 检测到并开始更新视图
+    wipRoot = {
+      child: null,
+      sibling: null,
+      parent: null,
+      dom: currentRoot.dom,
+      type: currentRoot.type,
+      props: currentRoot.props,
+      alternate: currentRoot,
+      effectTag: null,
+      hooks: null,
+    }
+
+    nextUnitOfWork = wipRoot
+
+    // 之前的 deletions 中的fiber已经没必要处理了，将 deletions 数组初始化
+    deletions = []
+  }
+
+  // 将 hook 加入到当前执行的函数组件对应的 fiber 中
+  // 这样下次执行函数组件的时候就能够从其对应的 fiber 中获取到本次的 hook
+  wipFiber.hooks.push(hook)
+  hookIndex++
+
+  return [hook.state, setState]
+}
+```
+
+我们来看看 `main.tsx`的 Counter 能不能跑起来
+
+![最终效果.gif](https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/92e9b9d5435043e0be294094d8281c9e~tplv-k3u1fbpfcp-watermark.image?)
+
+完美跑起来啦~
+
+## 欢迎加入我的掘金粉丝群~
+
+我正在参加掘金 2022 年度人气创作者榜单活动，感兴趣的读者可以加入我的粉丝群我们一起交流前端技术问题，也欢迎进来唠嗑唠嗑，之后会有不定期福利发放哦~
+
+扫描下方二维码即可加入我的掘金粉丝群啦~
+
+![掘金粉丝群企业微信二维码.jpg](https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/7f51b12c398845d4b04b7f23e186c8ca~tplv-k3u1fbpfcp-watermark.image?)

@@ -23,6 +23,9 @@ interface Fiber<
 
   /** @description commit 阶段要如何处理 fiber */
   effectTag: 'UPDATE' | 'PLACEMENT' | 'DELETION' | null
+
+  /** @description 函数组件的 fiber 对应的 hooks */
+  hooks: any[] | null
 }
 
 type FiberChild = DidactElement | DidactTextElement | null | undefined

@@ -19,6 +19,12 @@ let currentRoot: Fiber | null = null
 /** @description 记录需要被删除的 fiber */
 let deletions: Fiber[] = []
 
+/** @description 记录当前正在工作的函数组件对应的 fiber */
+let wipFiber: Fiber | null = null
+
+/** @description 记录当前执行的 hook 的下标 */
+let hookIndex: number | null = null
+
 function render(element: DidactElement, container: HTMLElement) {
   // 创建 root fiber
   wipRoot = {
@@ -32,6 +38,7 @@ function render(element: DidactElement, container: HTMLElement) {
     },
     alternate: currentRoot,
     effectTag: null,
+    hooks: null,
   }
 
   nextUnitOfWork = wipRoot
@@ -98,6 +105,10 @@ function performUnitOfWork(fiber: Fiber): Fiber | null {
  * @description 更新函数组件
  */
 function updateFunctionComponent(fiber: Fiber) {
+  wipFiber = fiber
+  hookIndex = 0
+  wipFiber.hooks = []
+
   const children = [(fiber.type as JSXElementConstructor<any>)(fiber.props)]
   reconcileChildren(fiber, children)
 }
@@ -128,11 +139,8 @@ function createDOM(fiber: Fiber) {
       : document.createElement(type as string)
 
   // 把 element.props 赋值到 DOM 元素上
-  Object.keys(props)
-    .filter(isProperty)
-    .forEach((name) => {
-      dom[name] = props[name]
-    })
+  // @ts-ignore
+  updateDOM(dom, {}, fiber.props)
 
   return dom
 }
@@ -170,6 +178,7 @@ function reconcileChildren(wipFiber: Fiber, children: FiberChild[]) {
         props: element.props,
         alternate: oldFiber,
         effectTag: 'UPDATE',
+        hooks: null,
       }
     }
 
@@ -184,6 +193,7 @@ function reconcileChildren(wipFiber: Fiber, children: FiberChild[]) {
         props: element.props,
         alternate: null,
         effectTag: 'PLACEMENT',
+        hooks: null,
       }
     }
 
@@ -193,11 +203,16 @@ function reconcileChildren(wipFiber: Fiber, children: FiberChild[]) {
       deletions.push(oldFiber)
     }
 
+    // 同一层的 fiber 全都要 reconcile
+    if (oldFiber) {
+      oldFiber = oldFiber.sibling
+    }
+
     // 完善 fiber 指向关系
     if (i === 0) {
       // 第一个子元素对应的 newFiber 作为 fiber.child
       wipFiber.child = newFiber
-    } else {
+    } else if (element) {
       // 后续子元素依次作为前一个子元素的 sibling
       prevSibling.sibling = newFiber
     }
@@ -274,7 +289,7 @@ function updateDOM(
   // 移除不存在于新 props 中或者发生变化了的的这些 event props，并且要移除相应的事件监听器
   Object.keys(prevProps)
     .filter(isEventPropertyKey)
-    .filter((key) => !(key in nextProps) || isNew(prevProps)(key))
+    .filter((key) => !(key in nextProps) || isNew(prevProps, nextProps)(key))
     .forEach((name) => {
       dom.removeEventListener(eventType(name), prevProps[name])
     })
@@ -290,7 +305,7 @@ function updateDOM(
   // 遍历新 props，添加不存在于旧 props 的 property
   Object.keys(nextProps)
     .filter(isProperty)
-    .filter(isNew(prevProps))
+    .filter(isNew(prevProps, nextProps))
     .forEach((name) => {
       dom[name] = nextProps[name]
     })
@@ -298,7 +313,7 @@ function updateDOM(
   // 遍历新 props 中的 event props，添加不存在于旧 props 中的这些 event props，并添加相应的事件监听器
   Object.keys(nextProps)
     .filter(isEventPropertyKey)
-    .filter(isNew(prevProps))
+    .filter(isNew(prevProps, nextProps))
     .forEach((name) => {
       dom.addEventListener(eventType(name), nextProps[name])
     })
@@ -319,4 +334,53 @@ function commitDeletion(fiber: Fiber, parentDOM: DidactDOM) {
   }
 }
 
-export { render }
+function useState<T>(initial: T): [T, (action: SetStateAction<T>) => void] {
+  // 取出函数组件的旧 fiber 上的 hooks[hookIndex] 对应的 hook
+  const oldHook: UseStateHook<T> = wipFiber.alternate?.hooks?.[hookIndex]
+
+  const hook: UseStateHook<T> = {
+    // 尝试复用 oldHook 上的 state，没有的话则使用初始值
+    state: oldHook?.state ?? initial,
+
+    // 新 hook 中的 queue 初始化为空数组是因为旧 hook 对象上的 queue 被消费过后就没必要保存了
+    // 不初始化为空数组的话会导致每次的 setState 都被累积，但这是没必要的
+    queue: [],
+  }
+
+  // 消费 setState 的 action -- 改变 hook.state，多次 setState 会被合并为一次渲染
+  const actions = oldHook ? oldHook.queue : []
+  actions.forEach((action) => {
+    hook.state = action(hook.state)
+  })
+
+  const setState = (action: SetStateAction<T>) => {
+    hook.queue.push(action)
+
+    // 重新设置 wipRoot 和 nextUnitOfWork 以便让 workLoop 检测到并开始更新视图
+    wipRoot = {
+      child: null,
+      sibling: null,
+      parent: null,
+      dom: currentRoot.dom,
+      type: currentRoot.type,
+      props: currentRoot.props,
+      alternate: currentRoot,
+      effectTag: null,
+      hooks: null,
+    }
+
+    nextUnitOfWork = wipRoot
+
+    // 之前的 deletions 中的fiber已经没必要处理了，将 deletions 数组初始化
+    deletions = []
+  }
+
+  // 将 hook 加入到当前执行的函数组件对应的 fiber 中
+  // 这样下次执行函数组件的时候就能够从其对应的 fiber 中获取到本次的 hook
+  wipFiber.hooks.push(hook)
+  hookIndex++
+
+  return [hook.state, setState]
+}
+
+export { render, useState }

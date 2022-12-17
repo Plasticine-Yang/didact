@@ -7,8 +7,9 @@ const isGone = (nextProps: Fiber['props']) => (key: string) =>
   !(key in nextProps)
 
 /** @description 判断是否是旧 props 中不存在的 property */
-const isNew = (prevProps: Fiber['props']) => (key: string) =>
-  !(key in prevProps)
+const isNew =
+  (prevProps: Fiber['props'], nextProps: Fiber['props']) => (key: string) =>
+    prevProps[key] !== nextProps[key]
 
 /** @description 判断是否是事件属性名 */
 const isEventPropertyKey = (key: string) => key.startsWith('on')
